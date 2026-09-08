@@ -1,0 +1,158 @@
+import asyncio
+from scapy.all import ARP, Ether, srp
+
+
+def _srp_scan(ip_range):
+    """ARP ile ağdaki aktif cihazları bulur."""
+    arp_req = ARP(pdst=ip_range)
+    broadcast = Ether(dst="ff:ff:ff:ff:ff:ff")
+    packet = broadcast / arp_req
+
+    return srp(
+        packet,
+        timeout=2,
+        verbose=False
+    )[0]
+
+
+async def discover_hosts(ip_range):
+    print(f"[*] {ip_range} taranıyor... (ARP)")
+
+    loop = asyncio.get_running_loop()
+
+    # Scapy blocking olduğu için event loop'u kilitlememesi adına
+    # ayrı executor thread'inde çalıştırıyoruz.
+    answered_list = await loop.run_in_executor(
+        None,
+        _srp_scan,
+        ip_range
+    )
+
+    devices = []
+
+    for sent, received in answered_list:
+        devices.append({
+            "ip": received.psrc,
+            "mac": received.hwsrc
+        })
+
+    return devices
+
+
+async def scan_port(ip, port, open_ports, semaphore):
+    async with semaphore:
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(ip, port),
+                timeout=1.0
+            )
+
+            open_ports.append(port)
+
+            writer.close()
+
+            try:
+                await writer.wait_closed()
+            except (ConnectionError, OSError):
+                pass
+
+        except (
+            asyncio.TimeoutError,
+            ConnectionRefusedError,
+            ConnectionResetError,
+            OSError
+        ):
+            pass
+
+
+async def scan_target_port(ip, ports):
+    open_ports = []
+
+    # Aynı anda en fazla 100 bağlantı
+    semaphore = asyncio.Semaphore(100)
+
+    tasks = [
+        scan_port(
+            ip,
+            port,
+            open_ports,
+            semaphore
+        )
+        for port in ports
+    ]
+
+    await asyncio.gather(*tasks)
+
+    # Portları küçükten büyüğe sırala
+    open_ports.sort()
+
+    return open_ports
+
+
+async def main():
+    # Kendi yerel ağın için değiştir
+    target_network = "Your ip and prefix"
+
+    # Yaygın portlar
+    common_ports = [
+        21,     # FTP
+        22,     # SSH
+        23,     # Telnet
+        80,     # HTTP
+        443,    # HTTPS
+        445,    # SMB
+        8080    # HTTP-alt
+    ]
+
+    print("=" * 50)
+    print("        YEREL AĞ TARAMA ARACI")
+    print("=" * 50)
+
+    try:
+        active_hosts = await discover_hosts(target_network)
+
+    except PermissionError:
+        print("[!] ARP taraması için yönetici/root yetkisi gerekiyor.")
+        return
+
+    except Exception as e:
+        print(f"[!] ARP taraması sırasında hata: {e}")
+        return
+
+    print(
+        f"\n[+] Toplam {len(active_hosts)} aktif cihaz bulundu.\n"
+    )
+
+    if not active_hosts:
+        print("[!] Aktif cihaz bulunamadı.")
+        return
+
+    for host in active_hosts:
+        ip = host["ip"]
+        mac = host["mac"]
+
+        print(f"Target: {ip} [{mac}]")
+        print("[*] Portlar taranıyor...")
+
+        try:
+            open_ports = await scan_target_port(
+                ip,
+                common_ports
+            )
+
+            if open_ports:
+                print(f"[+] Açık portlar: {open_ports}")
+            else:
+                print("[-] Açık port bulunamadı.")
+
+        except Exception as e:
+            print(f"[!] Port tarama hatası: {e}")
+
+        print("-" * 50)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n[!] Tarama kullanıcı tarafından durduruldu.")
